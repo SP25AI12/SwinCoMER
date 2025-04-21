@@ -18,7 +18,6 @@ class Encoder(pl.LightningModule):
         # Load pretrained SwinV2
         self.swin_model = Swinv2Model.from_pretrained(swin_variant)
         hidden_size = self.swin_model.config.hidden_size
-        # Project to d_model
         self.feature_proj = nn.Conv2d(hidden_size, d_model, kernel_size=1)
         self.pos_enc_2d = ImgPosEnc(d_model, normalize=True)
         self.norm = nn.LayerNorm(d_model)
@@ -26,15 +25,14 @@ class Encoder(pl.LightningModule):
     def forward(self, img: FloatTensor, img_mask: LongTensor) -> Tuple[FloatTensor, LongTensor]:
         # Convert grayscale to RGB
         img = img.repeat(1, 3, 1, 1)
-        # Extract features
         outputs = self.swin_model(pixel_values=img)
         feature = outputs.last_hidden_state  # [b, seq_len, hidden_size]
 
         b, seq_len, c = feature.size()
-        # Infer spatial dimensions
+        # Infer spatial dims
         h_feat = int(math.sqrt(seq_len))
         if h_feat * h_feat != seq_len:
-            # Find factor close to square
+            # Fallback: find divisor
             for h in range(h_feat, 0, -1):
                 if seq_len % h == 0:
                     h_feat = h
@@ -42,24 +40,28 @@ class Encoder(pl.LightningModule):
             else:
                 raise ValueError(f"Cannot find h, w for seq_len={seq_len}. seq_len must have factors to form a 2D grid.")
         w_feat = seq_len // h_feat
-        # Reshape to feature map
-        feature = feature.view(b, h_feat, w_feat, c).permute(0, 3, 1, 2)  # [b, c, h, w]
 
-        # Project channels
-        feature = self.feature_proj(feature)  # [b, d_model, h, w]
+        # Reshape to [b, hidden_size, h_feat, w_feat]
+        feature = feature.view(b, h_feat, w_feat, c).permute(0, 3, 1, 2)
 
-        # Downsample mask to match feature map
+        # Project to d_model
+        feature = self.feature_proj(feature)
+
+        # Downsample mask exactly to feature map size
         orig_h, orig_w = img.size(2), img.size(3)
-        ratio_h = math.ceil(orig_h / h_feat)
-        ratio_w = math.ceil(orig_w / w_feat)
-        mask = F.avg_pool2d(img_mask.float(), kernel_size=(ratio_h, ratio_w), stride=(ratio_h, ratio_w))
-        mask = (mask > 0.5).bool()  # Sử dụng bool để tạo mask kiểu torch.bool
+        if img_mask.size() != (b, orig_h, orig_w):
+            raise ValueError(f"Expected img_mask size {(b, orig_h, orig_w)}, got {img_mask.size()}")
+        mask = F.interpolate(
+            img_mask.unsqueeze(1).float(),
+            size=(h_feat, w_feat),
+            mode='nearest'
+        ).squeeze(1).bool()
 
-        # Rearrange for positional encoding
-        feature = rearrange(feature, "b d h w -> b h w d")
+        # Rearrange for positional encoding: [b, h_feat, w_feat, d_model]
+        feature = rearrange(feature, 'b d h w -> b h w d')
+        # Add positional encoding
         feature = self.pos_enc_2d(feature, mask)
-
-        # Normalize features
+        # Normalize
         feature = self.norm(feature)
 
         return feature, mask
