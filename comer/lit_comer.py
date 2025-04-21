@@ -15,9 +15,8 @@ class LitCoMER(pl.LightningModule):
     def __init__(
         self,
         d_model: int,
-        # encoder
-        growth_rate: int,
-        num_layers: int,
+        #encoder
+        swin_variant: str,
         # decoder
         nhead: int,
         num_decoder_layers: int,
@@ -41,8 +40,7 @@ class LitCoMER(pl.LightningModule):
 
         self.comer_model = CoMER(
             d_model=d_model,
-            growth_rate=growth_rate,
-            num_layers=num_layers,
+            swin_variant=swin_variant,
             nhead=nhead,
             num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
@@ -131,11 +129,10 @@ class LitCoMER(pl.LightningModule):
         return self.comer_model.beam_search(img, mask, **self.hparams)
 
     def configure_optimizers(self):
-        optimizer = optim.SGD(
+        optimizer = optim.AdamW(
             self.parameters(),
             lr=self.hparams.learning_rate,
-            momentum=0.9,
-            weight_decay=1e-4,
+            weight_decay=1e-2,
         )
 
         reduce_scheduler = optim.lr_scheduler.ReduceLROnPlateau(

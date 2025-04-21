@@ -43,12 +43,14 @@ class ScaleToLimitRange:
 
 
 class ScaleAugmentation:
-    def __init__(self, lo: float, hi: float) -> None:
-        assert lo <= hi
-        self.lo = lo
-        self.hi = hi
+    def __init__(self, min_scale=0.7, max_scale=1.4):
+        self.s_range = (min_scale, max_scale)
 
-    def __call__(self, img: np.ndarray) -> np.ndarray:
-        k = np.random.uniform(self.lo, self.hi)
-        img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_LINEAR)
+    def __call__(self, img):
+        s = np.random.uniform(*self.s_range)
+        h, w = img.shape[:2]
+        new_h, new_w = int(h * s), int(w * s)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        # Thêm bước resize về 256x256
+        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)
         return img
