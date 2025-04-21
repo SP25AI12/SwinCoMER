@@ -10,6 +10,13 @@ trainer:
         monitor: val_ExpRate
         mode: max
         filename: '{epoch}-{step}-{val_ExpRate:.4f}'
+  logger:
+    - class_path: pytorch_lightning.loggers.WandbLogger
+      init_args:
+        project: "SwinCoMER"
+        name: "kaggle-run"
+        save_dir: "."
+        log_model: false
   devices: 1
   accelerator: "gpu"
   check_val_every_n_epoch: 2
