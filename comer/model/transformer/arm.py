@@ -2,40 +2,6 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 from torch import Tensor
-from torch.nn.modules.batchnorm import BatchNorm1d
-
-
-class MaskBatchNorm2d(nn.Module):
-    def __init__(self, num_features: int):
-        super().__init__()
-        self.bn = BatchNorm1d(num_features)
-
-    def forward(self, x: Tensor, mask: Tensor) -> Tensor:
-        """
-        Parameters
-        ----------
-        x : Tensor
-            [b, d, h, w]
-        mask : Tensor
-            [b, 1, h, w]
-
-        Returns
-        -------
-        Tensor
-            [b, d, h, w]
-        """
-        x = rearrange(x, "b d h w -> b h w d")
-        mask = mask.squeeze(1)
-
-        not_mask = ~mask
-
-        flat_x = x[not_mask, :]
-        flat_x = self.bn(flat_x)
-        x[not_mask, :] = flat_x
-
-        x = rearrange(x, "b h w d -> b d h w")
-
-        return x
 
 
 class AttentionRefinementModule(nn.Module):
@@ -46,57 +12,53 @@ class AttentionRefinementModule(nn.Module):
         self.cross_coverage = cross_coverage
         self.self_coverage = self_coverage
 
-        if cross_coverage and self_coverage:
-            in_chs = 2 * nhead
-        else:
-            in_chs = nhead
-
+        # Number of channel inputs to conv: 2*nhead if both coverages, else nhead
+        in_chs = 2 * nhead if (cross_coverage and self_coverage) else nhead
         self.conv = nn.Conv2d(in_chs, dc, kernel_size=5, padding=2)
         self.act = nn.ReLU(inplace=True)
-
         self.proj = nn.Conv2d(dc, nhead, kernel_size=1, bias=False)
-        self.post_norm = MaskBatchNorm2d(nhead)
+        # Use standard BatchNorm2d instead of mask-based norm
+        self.post_norm = nn.BatchNorm2d(nhead)
 
     def forward(
         self, prev_attn: Tensor, key_padding_mask: Tensor, h: int, curr_attn: Tensor
     ) -> Tensor:
-        """
-        Parameters
-        ----------
-        prev_attn : Tensor
-            [(b * nhead), t, l]
-        key_padding_mask : Tensor
-            [b, l]
-        h : int
-
-        Returns
-        -------
-        Tensor
-            [(b * nhead), t, l]
-        """
+        # prev_attn: [(b * nhead), t, l]
+        # key_padding_mask: [b, l], l = h*w
+        # h: rows count, curr_attn same shape as prev_attn
         t = curr_attn.shape[1]
-        mask = repeat(key_padding_mask, "b (h w) -> (b t) () h w", h=h, t=t)
+        # build spatial mask for conv/masked_fill: [b*t, 1, h, w]
+        mask = repeat(key_padding_mask, "b (h w) -> (b t) () h w", h=h, t=t).bool()
 
-        curr_attn = rearrange(curr_attn, "(b n) t l -> b n t l", n=self.nhead)
-        prev_attn = rearrange(prev_attn, "(b n) t l -> b n t l", n=self.nhead)
+        # reshape attention to [b, nhead, t, l]
+        curr = rearrange(curr_attn, "(b n) t l -> b n t l", n=self.nhead)
+        prev = rearrange(prev_attn, "(b n) t l -> b n t l", n=self.nhead)
 
         attns = []
         if self.cross_coverage:
-            attns.append(prev_attn)
+            attns.append(prev)
         if self.self_coverage:
-            attns.append(curr_attn)
-        attns = torch.cat(attns, dim=1)
+            attns.append(curr)
+        attns = torch.cat(attns, dim=1)  # [b, in_chs, t, l]
 
-        attns = attns.cumsum(dim=2) - attns
+        # deterministic cumsum on CPU then back to device
+        attns_cpu = attns.cpu()
+        cum = attns_cpu.cumsum(dim=2)
+        attns = cum.to(attns.device) - attns
+
+        # reshape for conv: [b*t, in_chs, h, w]
         attns = rearrange(attns, "b n t (h w) -> (b t) n h w", h=h)
-
         cov = self.conv(attns)
         cov = self.act(cov)
 
+        # mask out invalid spatial regions
         cov = cov.masked_fill(mask, 0.0)
+
+        # project back to nhead channels
         cov = self.proj(cov)
+        # apply standard BatchNorm2d
+        cov = self.post_norm(cov)
 
-        cov = self.post_norm(cov, mask)
-
+        # reshape output: [(b*nhead), t, (h*w)]
         cov = rearrange(cov, "(b t) n h w -> (b n) t (h w)", t=t)
         return cov

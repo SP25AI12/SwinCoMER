@@ -57,7 +57,7 @@ class Encoder(pl.LightningModule):
         ratio_h = math.ceil(orig_h / h)
         ratio_w = math.ceil(orig_w / w)
         mask = F.avg_pool2d(img_mask.float(), kernel_size=(ratio_h, ratio_w), stride=(ratio_h, ratio_w))
-        mask = (mask > 0.5).long()  # Binarize mask
+        mask = (mask > 0.5).bool() # Binarize mask
 
         # Rearrange feature
         feature = rearrange(feature, "b d h w -> b h w d")

@@ -2,6 +2,8 @@ import copy
 from functools import partial
 from typing import Optional
 
+import torch
+import warnings
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
@@ -109,11 +111,40 @@ class TransformerDecoderLayer(nn.Module):
         Shape:
             see the docs in Transformer class.
         """
+        # Self-attention
         tgt2 = self.self_attn(
-            tgt, tgt, tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
+            tgt, tgt, tgt,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask
         )[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
+
+        # --- BEGIN PATCH: ensure memory_key_padding_mask has shape [batch, src_len] ---
+        tgt_len, bsz, _ = tgt.size()
+        src_len = memory.size(0)
+        if memory_key_padding_mask is not None:
+            # flatten 3D mask [batch, H, W] to [batch, H*W]
+            if memory_key_padding_mask.dim() == 3:
+                b, h_mask, w_mask = memory_key_padding_mask.shape
+                memory_key_padding_mask = memory_key_padding_mask.view(b, h_mask * w_mask)
+            # if length mismatch, warn and pad/truncate
+            if memory_key_padding_mask.size(1) != src_len:
+                warnings.warn(
+                    f"memory_key_padding_mask length {memory_key_padding_mask.size(1)} != src_len {src_len}; "
+                    "padding/truncating to match sequence length."
+                )
+                if memory_key_padding_mask.size(1) < src_len:
+                    pad_len = src_len - memory_key_padding_mask.size(1)
+                    memory_key_padding_mask = torch.cat([
+                        memory_key_padding_mask,
+                        torch.ones(bsz, pad_len, device=memory_key_padding_mask.device, dtype=memory_key_padding_mask.dtype)
+                    ], dim=1)
+                else:
+                    memory_key_padding_mask = memory_key_padding_mask[:, :src_len]
+        # --- END PATCH ---
+
+        # Cross-attention
         tgt2, attn = self.multihead_attn(
             tgt,
             memory,
@@ -122,9 +153,13 @@ class TransformerDecoderLayer(nn.Module):
             attn_mask=memory_mask,
             key_padding_mask=memory_key_padding_mask,
         )
+
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
+
+        # Feedforward
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+
         return tgt, attn

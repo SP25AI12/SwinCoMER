@@ -82,8 +82,9 @@ class ImgPosEnc(pl.LightningModule):
             [b, h, w, d]
         """
         not_mask = ~mask
-        y_embed = not_mask.cumsum(1, dtype=torch.float32)
-        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        not_mask_cpu = not_mask.to('cpu')
+        y_embed = not_mask_cpu.cumsum(1, dtype=torch.float32).to(not_mask.device)
+        x_embed = not_mask_cpu.cumsum(2, dtype=torch.float32).to(not_mask.device)
         if self.normalize:
             eps = 1e-6
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale

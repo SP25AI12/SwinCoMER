@@ -10,6 +10,13 @@ from torch.nn.init import constant_, xavier_normal_, xavier_uniform_
 from .arm import AttentionRefinementModule
 
 
+def _ensure_bool_mask(mask: Tensor) -> Tensor:
+    """Convert any non-bool mask to bool tensor."""
+    if mask.dtype != torch.bool:
+        return mask.to(torch.bool)
+    return mask
+
+
 class MultiheadAttention(nn.Module):
     bias_k: Optional[torch.Tensor]
     bias_v: Optional[torch.Tensor]
@@ -38,7 +45,7 @@ class MultiheadAttention(nn.Module):
             self.head_dim * num_heads == self.embed_dim
         ), "embed_dim must be divisible by num_heads"
 
-        if self._qkv_same_embed_dim is False:
+        if not self._qkv_same_embed_dim:
             self.q_proj_weight = nn.Parameter(torch.Tensor(embed_dim, embed_dim))
             self.k_proj_weight = nn.Parameter(torch.Tensor(embed_dim, self.kdim))
             self.v_proj_weight = nn.Parameter(torch.Tensor(embed_dim, self.vdim))
@@ -204,7 +211,6 @@ def multi_head_attention_forward(
                 k = None
                 v = None
             else:
-
                 # This is inline in_proj function with in_proj_weight and in_proj_bias
                 _b = in_proj_bias
                 _start = embed_dim
@@ -265,58 +271,6 @@ def multi_head_attention_forward(
             k = F.linear(key, k_proj_weight_non_opt, in_proj_bias)
             v = F.linear(value, v_proj_weight_non_opt, in_proj_bias)
     q = q * scaling
-
-    if attn_mask is not None:
-        assert (
-            attn_mask.dtype == torch.float32
-            or attn_mask.dtype == torch.float64
-            or attn_mask.dtype == torch.float16
-            or attn_mask.dtype == torch.uint8
-            or attn_mask.dtype == torch.bool
-        ), "Only float, byte, and bool types are supported for attn_mask, not {}".format(
-            attn_mask.dtype
-        )
-        if attn_mask.dtype == torch.uint8:
-            warnings.warn(
-                "Byte tensor for attn_mask in nn.MultiheadAttention is deprecated. Use bool tensor instead."
-            )
-            attn_mask = attn_mask.to(torch.bool)
-
-        if attn_mask.dim() == 2:
-            attn_mask = attn_mask.unsqueeze(0)
-            if list(attn_mask.size()) != [1, query.size(0), key.size(0)]:
-                raise RuntimeError("The size of the 2D attn_mask is not correct.")
-        elif attn_mask.dim() == 3:
-            if list(attn_mask.size()) != [bsz * num_heads, query.size(0), key.size(0)]:
-                raise RuntimeError("The size of the 3D attn_mask is not correct.")
-        else:
-            raise RuntimeError(
-                "attn_mask's dimension {} is not supported".format(attn_mask.dim())
-            )
-        # attn_mask's dim is 3 now.
-
-    # convert ByteTensor key_padding_mask to bool
-    if key_padding_mask is not None and key_padding_mask.dtype == torch.uint8:
-        warnings.warn(
-            "Byte tensor for key_padding_mask in nn.MultiheadAttention is deprecated. Use bool tensor instead."
-        )
-        key_padding_mask = key_padding_mask.to(torch.bool)
-
-    if bias_k is not None and bias_v is not None:
-        if static_k is None and static_v is None:
-            k = torch.cat([k, bias_k.repeat(1, bsz, 1)])
-            v = torch.cat([v, bias_v.repeat(1, bsz, 1)])
-            if attn_mask is not None:
-                attn_mask = F.pad(attn_mask, (0, 1))
-            if key_padding_mask is not None:
-                key_padding_mask = F.pad(key_padding_mask, (0, 1))
-        else:
-            assert static_k is None, "bias cannot be added to static key."
-            assert static_v is None, "bias cannot be added to static value."
-    else:
-        assert bias_k is None
-        assert bias_v is None
-
     q = q.contiguous().view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
     if k is not None:
         k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
@@ -338,58 +292,74 @@ def multi_head_attention_forward(
     if key_padding_mask is not None:
         assert key_padding_mask.size(0) == bsz
         assert key_padding_mask.size(1) == src_len
+        
+    # Ensure masks are boolean
+    if key_padding_mask is not None:
+        key_padding_mask = _ensure_bool_mask(key_padding_mask)
+    if attn_mask is not None:
+        attn_mask = _ensure_bool_mask(attn_mask)
+        # Kiểm tra kích thước của attn_mask
+        if attn_mask.dim() == 2:
+            attn_mask = attn_mask.unsqueeze(0)  # [1, tgt_len, src_len]
+            if list(attn_mask.size()) != [1, tgt_len, src_len]:
+                raise RuntimeError("The size of the 2D attn_mask is not correct.")
+        elif attn_mask.dim() == 3:
+            if list(attn_mask.size()) != [bsz * num_heads, tgt_len, src_len]:
+                raise RuntimeError("The size of the 3D attn_mask is not correct.")
+        else:
+            raise RuntimeError("attn_mask's dimension {} is not supported".format(attn_mask.dim()))
+
+    if bias_k is not None and bias_v is not None:
+        if static_k is None and static_v is None:
+            k = torch.cat([k, bias_k.repeat(1, bsz, 1)])
+            v = torch.cat([v, bias_v.repeat(1, bsz, 1)])
+            if attn_mask is not None:
+                attn_mask = F.pad(attn_mask, (0, 1))
+            if key_padding_mask is not None:
+                key_padding_mask = F.pad(key_padding_mask, (0, 1))
+        else:
+            assert static_k is None, "bias cannot be added to static key."
+            assert static_v is None, "bias cannot be added to static value."
+    else:
+        assert bias_k is None
+        assert bias_v is None
 
     if add_zero_attn:
-        src_len += 1
-        k = torch.cat(
-            [
-                k,
-                torch.zeros(
-                    (k.size(0), 1) + k.size()[2:], dtype=k.dtype, device=k.device
-                ),
-            ],
-            dim=1,
-        )
-        v = torch.cat(
-            [
-                v,
-                torch.zeros(
-                    (v.size(0), 1) + v.size()[2:], dtype=v.dtype, device=v.device
-                ),
-            ],
-            dim=1,
-        )
+        # pad one zero key/value vector
+        zero_k = torch.zeros((k.size(0), 1, k.size(2)), dtype=k.dtype, device=k.device)
+        zero_v = torch.zeros((v.size(0), 1, v.size(2)), dtype=v.dtype, device=v.device)
+        k = torch.cat([k, zero_k], dim=1)
+        v = torch.cat([v, zero_v], dim=1)
+        # extend attn_mask on last dim
         if attn_mask is not None:
             attn_mask = F.pad(attn_mask, (0, 1))
+        # extend key_padding_mask
         if key_padding_mask is not None:
-            key_padding_mask = F.pad(key_padding_mask, (0, 1))
+            pad = torch.zeros((key_padding_mask.size(0), 1), dtype=torch.bool, device=key_padding_mask.device)
+            key_padding_mask = torch.cat([key_padding_mask, pad], dim=1)
+        src_len += 1
 
     attn_output_weights = torch.bmm(q, k.transpose(1, 2))
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
-    def mask_softmax_dropout(dots):
+    def mask_softmax_dropout(dots: Tensor) -> Tensor:
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                dots.masked_fill_(attn_mask, float("-inf"))
+                dots = dots.masked_fill(attn_mask, float('-inf'))
             else:
-                dots += attn_mask
-
+                dots += attn_mask  # attn_mask có thể là kiểu float để thêm bias
         if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # [bsz,1,1,src_len]
             dots = dots.view(bsz, num_heads, tgt_len, src_len)
-            dots = dots.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2),
-                float("-inf"),
-            )
+            dots = dots.masked_fill(mask, float('-inf'))
             dots = dots.view(bsz * num_heads, tgt_len, src_len)
-
         attn = F.softmax(dots, dim=-1)
-        attn = F.dropout(attn, p=dropout_p, training=training)
-        return attn
+        return F.dropout(attn, p=dropout_p, training=training)
 
     attention = mask_softmax_dropout(attn_output_weights)
     if arm is not None:
-        attn_output_weights -= arm(attention)
-        attention = mask_softmax_dropout(attn_output_weights)
+        attn_weights = attn_output_weights - arm(attention)
+        attention = mask_softmax_dropout(attn_weights)
 
     attn_output = torch.bmm(attention, v)
     assert list(attn_output.size()) == [bsz * num_heads, tgt_len, head_dim]
@@ -398,5 +368,4 @@ def multi_head_attention_forward(
 
     if need_weights:
         return attn_output, attention
-    else:
-        return attn_output, None
+    return attn_output, None
