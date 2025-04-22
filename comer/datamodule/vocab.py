@@ -23,17 +23,24 @@ class CROHMEVocab:
         with open(dict_path, "r") as f:
             for line in f.readlines():
                 w = line.strip()
-                self.word2idx[w] = len(self.word2idx)
+                if w:  # Bỏ qua dòng trống
+                    self.word2idx[w] = len(self.word2idx)
 
         self.idx2word: Dict[int, str] = {v: k for k, v in self.word2idx.items()}
 
-        # print(f"Init vocab with size: {len(self.word2idx)}")
+        print(f"Init vocab with size: {len(self.word2idx)}")
 
     def words2indices(self, words: List[str]) -> List[int]:
-        return [self.word2idx[w] for w in words]
+        indices = []
+        for w in words:
+            if w not in self.word2idx:
+                print(f"Warning: Token '{w}' not found in vocabulary, skipping.")
+                continue
+            indices.append(self.word2idx[w])
+        return indices
 
     def indices2words(self, id_list: List[int]) -> List[str]:
-        return [self.idx2word[i] for i in id_list]
+        return [self.idx2word[i] for i in id_list if i in self.idx2word]
 
     def indices2label(self, id_list: List[int]) -> str:
         words = self.indices2words(id_list)

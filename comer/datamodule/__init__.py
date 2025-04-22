@@ -1,11 +1,10 @@
-from .datamodule import Batch, CROHMEDatamodule
+from .customdatamodule import CustomDataModule
 from .vocab import vocab
 
 vocab_size = len(vocab)
 
 __all__ = [
-    "CROHMEDatamodule",
+    "CustomDataModule",
     "vocab",
-    "Batch",
     "vocab_size",
 ]

@@ -44,8 +44,7 @@ model:
   learning_rate: 1e-4
   patience: 15
 data:
-  zipfile_path: data.zip
-  test_year: '2014'
+  zipfile_path: "customdataset.zip"
   train_batch_size: 4
   eval_batch_size: 2
   num_workers: 5

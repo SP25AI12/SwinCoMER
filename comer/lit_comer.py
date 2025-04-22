@@ -5,7 +5,7 @@ import pytorch_lightning as pl
 import torch.optim as optim
 from torch import FloatTensor, LongTensor
 
-from comer.datamodule import Batch, vocab
+from .datamodule.vocab import vocab  # Import vocab từ customdatamodule
 from comer.model.comer import CoMER
 from comer.utils.utils import (ExpRateRecorder, Hypothesis, ce_loss,
                                to_bi_tgt_out)
@@ -15,7 +15,7 @@ class LitCoMER(pl.LightningModule):
     def __init__(
         self,
         d_model: int,
-        #encoder
+        # encoder
         swin_variant: str,
         # decoder
         nhead: int,
@@ -73,18 +73,19 @@ class LitCoMER(pl.LightningModule):
         """
         return self.comer_model(img, img_mask, tgt)
 
-    def training_step(self, batch: Batch, _):
-        tgt, out = to_bi_tgt_out(batch.indices, self.device)
-        out_hat = self(batch.imgs, batch.mask, tgt)
+    def training_step(self, batch, _):
+        # batch giờ là một dictionary
+        tgt, out = to_bi_tgt_out(batch['indices'], self.device)
+        out_hat = self(batch['imgs'], batch['mask'], tgt)
 
         loss = ce_loss(out_hat, out)
         self.log("train_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
 
         return loss
 
-    def validation_step(self, batch: Batch, _):
-        tgt, out = to_bi_tgt_out(batch.indices, self.device)
-        out_hat = self(batch.imgs, batch.mask, tgt)
+    def validation_step(self, batch, _):
+        tgt, out = to_bi_tgt_out(batch['indices'], self.device)
+        out_hat = self(batch['imgs'], batch['mask'], tgt)
 
         loss = ce_loss(out_hat, out)
         self.log(
@@ -96,9 +97,9 @@ class LitCoMER(pl.LightningModule):
             sync_dist=True,
         )
 
-        hyps = self.approximate_joint_search(batch.imgs, batch.mask)
+        hyps = self.approximate_joint_search(batch['imgs'], batch['mask'])
 
-        self.exprate_recorder([h.seq for h in hyps], batch.indices)
+        self.exprate_recorder([h.seq for h in hyps], batch['indices'].tolist())
         self.log(
             "val_ExpRate",
             self.exprate_recorder,
@@ -107,10 +108,10 @@ class LitCoMER(pl.LightningModule):
             on_epoch=True,
         )
 
-    def test_step(self, batch: Batch, _):
-        hyps = self.approximate_joint_search(batch.imgs, batch.mask)
-        self.exprate_recorder([h.seq for h in hyps], batch.indices)
-        return batch.img_bases, [vocab.indices2label(h.seq) for h in hyps]
+    def test_step(self, batch, _):
+        hyps = self.approximate_joint_search(batch['imgs'], batch['mask'])
+        self.exprate_recorder([h.seq for h in hyps], batch['indices'].tolist())
+        return batch['img_bases'], [vocab.indices2label(h.seq) for h in hyps]
 
     def test_epoch_end(self, test_outputs) -> None:
         exprate = self.exprate_recorder.compute()
