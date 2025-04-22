@@ -132,3 +132,5 @@ Results_pred_symlg
 
 #wandb
 wandb
+#large dataset
+customdataset.zip
