@@ -1,131 +1,144 @@
-import torchvision.transforms as tr
-from torch.utils.data.dataset import Dataset
-from typing import List
-import numpy as np
-import cv2
-from PIL import Image
+import os
+import linecache # Sử dụng linecache để đọc dòng hiệu quả hơn
+from typing import Tuple, Callable, Optional
 
+import torch
+from torch.utils.data import Dataset
+from PIL import Image, ImageOps, ImageFilter
+import random
+import torchvision.transforms.functional as TF
 from .transforms import ScaleAugmentation, ScaleToLimitRange
 
-# Các tham số mặc định cho kích thước ảnh
-H_LO = 32   # Chiều cao tối thiểu
-H_HI = 512  # Chiều cao tối đa
-W_LO = 32   # Chiều rộng tối thiểu
-W_HI = 1024 # Chiều rộng tối đa
-K_MIN = 0.8 # Tỷ lệ scale tối thiểu
-K_MAX = 1.2 # Tỷ lệ scale tối đa
-FIXED_SIZE = (256, 256)  # Kích thước cố định sau khi resize
-ASPECT_RATIO_RANGE = (0.2, 5.0)  # Khoảng tỷ lệ khung hình mặc định
 
 
 class CustomDataset(Dataset):
     def __init__(
         self,
-        ds: List[tuple],
-        is_train: bool,
-        scale_aug: bool,
-        h_lo: int = H_LO,
-        h_hi: int = H_HI,
-        w_lo: int = W_LO,
-        w_hi: int = W_HI,
-        k_min: float = K_MIN,
-        k_max: float = K_MAX,
-        fixed_size: tuple = FIXED_SIZE,
-        binarize: bool = True,
-        contrast: bool = True,
-        rotate: bool = True,
-        enforce_aspect_ratio: bool = True,
-        aspect_ratio_range: tuple = ASPECT_RATIO_RANGE
-    ) -> None:
+        caption_file: str,
+        img_dir: str,
+        transform: Optional[Callable] = None,
+        max_width: Optional[int] = None, # Không dùng trực tiếp, dùng trong transform
+        max_height: Optional[int] = None, # Không dùng trực tiếp, dùng trong transform
+    ):
         super().__init__()
-        self.ds = ds
-        self.is_train = is_train
-        self.scale_aug = scale_aug
-        self.fixed_size = fixed_size
-        self.binarize = binarize
-        self.contrast = contrast
-        self.rotate = rotate
+        self.caption_file = caption_file
+        self.img_dir = img_dir
+        self.transform = transform
+        # self.max_width = max_width # Không cần lưu nếu đã tích hợp vào transform
+        # self.max_height = max_height # Không cần lưu nếu đã tích hợp vào transform
 
-        # Tạo pipeline biến đổi
-        trans_list = []
+        # Tính toán và lưu trữ độ dài dataset một lần
+        self._length = self._count_lines(self.caption_file)
+        print(f"Initialized CustomDataset for {caption_file} with {self._length} samples.")
+        # Xóa cache của linecache nếu tệp có thể thay đổi (thường không cần trong huấn luyện)
+        # linecache.clearcache()
 
-        # Nhị phân hóa ảnh để làm nổi bật nét chữ
-        if self.binarize:
-            trans_list.append(lambda img: self._binarize(img))
+    def _count_lines(self, filepath):
+        """Đếm số dòng trong file một cách hiệu quả."""
+        if not os.path.exists(filepath):
+             print(f"Warning: Caption file not found at {filepath}")
+             return 0
+        count = 0
+        # Sử dụng cách đọc khối để tăng tốc độ
+        with open(filepath, 'rb') as f:
+            while True:
+                buffer = f.read(8192*1024)
+                if not buffer:
+                    break
+                count += buffer.count(b'\n')
+        # Xử lý trường hợp file không kết thúc bằng newline
+        # Hoặc nếu file rỗng, count sẽ là 0, nên return 0
+        if count == 0 and os.path.getsize(filepath) > 0:
+             return 1 # Có ít nhất 1 dòng nếu file không rỗng và không có newline
+        # Nếu dòng cuối không có \n, count sẽ thiếu 1. Nhưng thường caption file sẽ có \n cuối.
+        # Giả định mỗi dòng kết thúc bằng \n
+        return count
 
-        # Tăng độ tương phản để cải thiện nhận diện
-        if self.contrast:
-            trans_list.append(lambda img: self._adjust_contrast(img))
 
-        # Xoay nhẹ ảnh để tăng tính đa dạng (chỉ áp dụng cho train)
-        if self.is_train and self.rotate:
-            trans_list.append(lambda img: self._rotate(img))
+    def __len__(self) -> int:
+        return self._length
 
-        # Scale augmentation (chỉ áp dụng cho train)
-        if self.is_train and self.scale_aug:
-            trans_list.append(ScaleAugmentation(min_scale=k_min, max_scale=k_max))
-
-        # Đảm bảo kích thước ảnh nằm trong khoảng cho phép
-        trans_list.append(
-            ScaleToLimitRange(
-                w_lo=w_lo,
-                w_hi=w_hi,
-                h_lo=h_lo,
-                h_hi=h_hi,
-                enforce_aspect_ratio=enforce_aspect_ratio,
-                aspect_ratio_range=aspect_ratio_range
-            )
-        )
-
-        # Padding để giữ tỷ lệ khung hình trước khi resize
-        trans_list.append(lambda img: self._pad_to_square(img))
-
-        # Resize về kích thước cố định
-        trans_list.append(lambda img: cv2.resize(img, fixed_size, interpolation=cv2.INTER_LINEAR))
-
-        # Chuyển thành tensor
-        trans_list.append(tr.ToTensor())
-
-        self.transform = tr.Compose(trans_list)
-
-    def _binarize(self, img: np.ndarray) -> np.ndarray:
-        """Nhị phân hóa ảnh để làm nổi bật nét chữ."""
-        _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    def binarize(self, img, threshold=200):
+        """Nhị phân hóa ảnh PIL (chuyển sang đen trắng)."""
+        # Chuyển sang ảnh xám trước nếu cần
+        if img.mode != 'L':
+            img = img.convert('L')
+        # Áp dụng ngưỡng
+        img = img.point(lambda x: 0 if x < threshold else 255, '1') # Chế độ '1' là black/white
+        # Chuyển về 'L' để tương thích với các transform khác nếu cần
+        img = img.convert('L')
         return img
 
-    def _adjust_contrast(self, img: np.ndarray) -> np.ndarray:
-        """Tăng độ tương phản của ảnh."""
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        return clahe.apply(img)
+    def resize(self, img, max_w, max_h):
+         """Thay đổi kích thước ảnh PIL giữ tỷ lệ và thêm padding."""
+         # Hàm này có thể không cần thiết nếu dùng ScaleToLimitRange
+         w, h = img.size
+         ratio = min(max_w / w, max_h / h)
+         new_w = int(w * ratio)
+         new_h = int(h * ratio)
+         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+         # Tạo ảnh mới nền trắng và paste vào
+         new_img = Image.new("L", (max_w, max_h), 255)
+         new_img.paste(img, ((max_w - new_w) // 2, (max_h - new_h) // 2))
+         return new_img
 
-    def _rotate(self, img: np.ndarray) -> np.ndarray:
-        """Xoay nhẹ ảnh để tăng tính đa dạng."""
-        angle = np.random.uniform(-10, 10)  # Xoay ngẫu nhiên trong khoảng [-10, 10] độ
-        h, w = img.shape[:2]
-        center = (w // 2, h // 2)
-        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-        rotated = cv2.warpAffine(img, matrix, (w, h))
-        return rotated
 
-    def _pad_to_square(self, img: np.ndarray) -> np.ndarray:
-        """Thêm padding để giữ tỷ lệ khung hình trước khi resize."""
-        h, w = img.shape[:2]
-        max_side = max(h, w)
-        top = (max_side - h) // 2
-        bottom = max_side - h - top
-        left = (max_side - w) // 2
-        right = max_side - w - left
-        padded = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=255)
-        return padded
+    def __getitem__(self, idx: int) -> Tuple[Any, str]:
+        # Kiểm tra chỉ số hợp lệ
+        if idx >= self._length:
+            raise IndexError(f"Index {idx} out of bounds for dataset with length {self._length}")
 
-    def __getitem__(self, idx):
-        fname, img, caption = self.ds[idx]
+        # Đọc dòng thứ idx + 1 từ tệp caption (linecache bắt đầu từ 1)
+        # linecache rất hiệu quả cho việc đọc lại cùng một file nhiều lần
+        line = linecache.getline(self.caption_file, idx + 1).strip()
 
-        # Chuyển ảnh thành numpy array trước khi áp dụng biến đổi
-        img = np.array(img)
-        img = self.transform(img)
+        if not line:
+            print(f"Warning: Got empty line for index {idx} (line {idx+1}) in {self.caption_file}. Skipping.")
+            # Trả về mẫu đầu tiên hoặc xử lý khác
+            # return self.__getitem__(0) # Cẩn thận vòng lặp vô hạn!
+            raise RuntimeError(f"Empty line encountered at index {idx} in {self.caption_file}")
 
-        return fname, img, caption
+        # Phân tách dòng thành đường dẫn ảnh và công thức
+        try:
+            # Giả sử định dạng là: relative_img_path\tformula_str
+            img_rel_path, formula_str = line.split('\t', 1)
+        except ValueError:
+            print(f"Warning: Skipping malformed line {idx+1} in {self.caption_file}: '{line}'")
+            # return self.__getitem__( (idx + 1) % self._length ) # Thử mẫu kế tiếp
+            raise RuntimeError(f"Malformed line {idx+1} in {self.caption_file}")
 
-    def __len__(self):
-        return len(self.ds)
+
+        # Tạo đường dẫn ảnh đầy đủ
+        img_full_path = os.path.join(self.img_dir, img_rel_path)
+
+        # Tải ảnh và xử lý lỗi
+        try:
+            # Mở ảnh và đảm bảo nó ở dạng grayscale ('L') trước khi nhị phân hóa
+            img = Image.open(img_full_path).convert("L")
+
+            # Áp dụng nhị phân hóa (nếu cần)
+            img = self.binarize(img) # Giả sử hàm binarize trả về ảnh PIL chế độ 'L'
+
+            # Áp dụng các phép biến đổi đã định nghĩa (bao gồm resize/scale và ToTensor)
+            if self.transform:
+                img_tensor = self.transform(img) # transform nên bao gồm ToTensor()
+            else:
+                # Nếu không có transform, cần tự chuyển sang Tensor
+                img_tensor = TF.to_tensor(img)
+
+            # Kiểm tra kích thước tensor nếu cần debug
+            # print(f"Image {idx} tensor size: {img_tensor.shape}")
+
+        except FileNotFoundError:
+            print(f"ERROR: Image not found at {img_full_path} for index {idx}")
+            # return self.__getitem__( (idx + 1) % self._length ) # Thử mẫu kế tiếp
+            raise FileNotFoundError(f"Image not found: {img_full_path}")
+        except Exception as e:
+            print(f"ERROR: Failed to load or process image {img_full_path} for index {idx}: {e}")
+            # return self.__getitem__( (idx + 1) % self._length ) # Thử mẫu kế tiếp
+            raise RuntimeError(f"Error processing image: {img_full_path}")
+
+
+        # Trả về tensor ảnh và chuỗi công thức gốc
+        # Việc token hóa sẽ được thực hiện trong collate_fn của DataModule
+        return img_tensor, formula_str

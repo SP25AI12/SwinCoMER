@@ -1,158 +1,205 @@
 import os
-from typing import List, Tuple, Optional
-
 import pytorch_lightning as pl
-from PIL import Image
+from torch.utils.data import DataLoader, ConcatDataset
+from torchvision import transforms as T
 import torch
-from torch.utils.data import DataLoader
+from PIL import Image, ImageOps
+import random
+from typing import List, Optional, Tuple, Dict, Any
 
-from .dataset import CustomDataset  # Import từ dataset.py
-from .vocab import vocab  # Import từ vocab.py
+# Giả sử các import này tồn tại từ mã gốc hoặc cần thiết
+from .dataset import CustomDataset, ScaleAugmentation, ScaleToLimitRange
+from .vocab import CROHMEVocab # Giả sử vocab được import từ đây hoặc nơi khác phù hợp
 
-# A single sample: (filename_base, PIL.Image.Image, List[str])
-Data = List[Tuple[str, Image.Image, List[str]]]
-
-
-def extract_data_dir(data_dir: str) -> Data:
-    """
-    Read caption.txt and load images from a folder structure:
-        data_dir/
-          images/        # contains image files named <base>.(png/jpg/...)
-          caption.txt   # each line: <base>\t<formula tokens separated by spaces>
-
-    Returns list of (base, PIL.Image in grayscale, tokens list).
-    """
-    caption_path = os.path.join(data_dir, 'caption.txt')
-    image_dir = os.path.join(data_dir, 'image')
-
-    data: Data = []
-    with open(caption_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split('\t')
-            if len(parts) != 2:
-                continue
-            base, formula = parts
-            # locate image file
-            img_path = os.path.join(image_dir, base)
-            if not os.path.exists(img_path):
-                # try common extensions
-                for ext in ['.png', '.jpg', '.jpeg', '.bmp']:
-                    if os.path.exists(img_path + ext):
-                        img_path = img_path + ext
-                        break
-            try:
-                img = Image.open(img_path).convert('L')  # grayscale
-                # token list by splitting on space
-                tokens = formula.strip().split(' ')
-                data.append((base, img, tokens))
-            except Exception as e:
-                print(f"Error loading image {img_path}: {e}")
-                continue
-    print(f"Extracted {len(data)} samples from {data_dir}")
-    return data
-
-
-def collate_fn(batch):
-    """
-    Collate function to process a batch of samples from CustomDataset.
-    Each sample from CustomDataset is (fname, img, caption).
-
-    Args:
-        batch: List of samples, where each sample is (fname, img, caption).
-
-    Returns:
-        dict: Dictionary containing:
-            - img_bases: List[str], list of image filenames.
-            - imgs: FloatTensor [b, 1, H, W], batch of images.
-            - mask: LongTensor [b, H, W], batch of masks.
-            - indices: LongTensor [b, max_len], padded batch of token indices.
-    """
-    # Tách các thành phần từ batch
-    fnames = [item[0] for item in batch]
-    images = [item[1] for item in batch]
-    captions = [item[2] for item in batch]
-
-    # Chuyển captions thành indices
-    indices = [vocab.words2indices(cap) for cap in captions]
-
-    # Pad indices để có cùng độ dài
-    max_len = max(len(ind) for ind in indices)
-    indices_padded = torch.zeros(len(indices), max_len, dtype=torch.long)
-    for i, ind in enumerate(indices):
-        indices_padded[i, :len(ind)] = torch.tensor(ind, dtype=torch.long)
-
-    # Tạo tensor cho ảnh và mask
-    # Tất cả ảnh đã được resize về kích thước cố định (256x256) trong CustomDataset
-    imgs = torch.stack(images)  # [b, 1, H, W]
-
-    # Tạo mask (vì ảnh đã có kích thước cố định, mask đơn giản hơn)
-    # Giả sử giá trị 0 là nét chữ, giá trị 1 là nền
-    mask = (imgs.squeeze(1) > 0.5).long()  # [b, H, W]
-
-    return {
-        'img_bases': fnames,
-        'imgs': imgs,
-        'mask': mask,
-        'indices': indices_padded
-    }
-
+# Giả sử vocab được khởi tạo toàn cục hoặc trong __init__ nếu cần
+# Ví dụ: vocab = CROHMEVocab() # Hoặc lấy từ checkpoint/config
 
 class CustomDataModule(pl.LightningDataModule):
     def __init__(
         self,
         data_root: str,
-        train_batch_size: int = 8,
-        eval_batch_size: int = 4,
-        num_workers: int = 5,
-        scale_aug: bool = False,
+        vocab: CROHMEVocab, # Truyền vocab vào đây
+        batch_size: int = 8,
+        num_workers: int = 4,
+        max_image_size: Tuple[int, int] = (512, 128), # (h, w)
+        scale_aug_range: Tuple[float, float] = (0.7, 1.3),
+        pin_memory: bool = True,
+        train_transform=None,
+        val_transform=None,
+        test_transform=None,
+        collate_fn=None,
+        **kwargs,
     ):
         super().__init__()
         self.data_root = data_root
-        self.train_batch_size = train_batch_size
-        self.eval_batch_size = eval_batch_size
+        self.batch_size = batch_size
         self.num_workers = num_workers
-        self.scale_aug = scale_aug
+        self.max_image_size = max_image_size # (h, w)
+        self.scale_aug_range = scale_aug_range
+        self.pin_memory = pin_memory
+        self.vocab = vocab # Lưu vocab
 
-    def setup(self, stage: Optional[str] = None) -> None:
-        # Called on every GPU
-        if stage in (None, 'fit'):
-            train_dir = os.path.join(self.data_root, 'train')
-            val_dir = os.path.join(self.data_root, 'val')
-            train_data = extract_data_dir(train_dir)
-            val_data = extract_data_dir(val_dir)
-            self.train_dataset = CustomDataset(train_data, is_train=True, scale_aug=self.scale_aug)
-            self.val_dataset = CustomDataset(val_data, is_train=False, scale_aug=False)
-        if stage in (None, 'test'):
-            test_dir = os.path.join(self.data_root, 'test')
-            test_data = extract_data_dir(test_dir)
-            self.test_dataset = CustomDataset(test_data, is_train=False, scale_aug=False)
+        # Xác định transform mặc định nếu không được cung cấp
+        # Lưu ý: ScaleAugmentation áp dụng ScaleToLimitRange bên trong nó
+        self.train_transform = train_transform or T.Compose(
+            [
+                ScaleAugmentation(limit_range=max_image_size, scale_range=scale_aug_range),
+                T.ToTensor(),
+            ]
+        )
+        self.val_transform = val_transform or T.Compose(
+            [
+                ScaleToLimitRange(limit_range=max_image_size), # Chỉ thay đổi kích thước, không aug
+                T.ToTensor(),
+            ]
+        )
+        self.test_transform = test_transform or T.Compose(
+            [
+                ScaleToLimitRange(limit_range=max_image_size),
+                T.ToTensor(),
+            ]
+        )
 
-    def train_dataloader(self) -> DataLoader:
+        # Lưu collate_fn nếu được cung cấp, nếu không sẽ dùng mặc định
+        self.collate_fn = collate_fn or self.default_collate_fn
+
+    def _count_lines(self, filepath):
+        """Đếm số dòng trong file một cách hiệu quả."""
+        if not os.path.exists(filepath):
+             print(f"Warning: Caption file not found at {filepath}")
+             return 0
+        count = 0
+        with open(filepath, 'rb') as f: # Mở ở chế độ binary để nhanh hơn
+            while True:
+                buffer = f.read(8192*1024) # Đọc khối lớn
+                if not buffer:
+                    break
+                count += buffer.count(b'\n')
+        return count + 1 # Cộng 1 vì dòng cuối thường không có \n
+
+    def setup(self, stage: Optional[str] = None):
+        """
+        Không tải toàn bộ dữ liệu vào bộ nhớ ở đây.
+        Chỉ lưu đường dẫn và khởi tạo Dataset objects.
+        """
+        print(f"Setting up data for stage: {stage}")
+
+        # Train/Val setup
+        if stage == "fit" or stage is None:
+            train_caption_path = os.path.join(self.data_root, "train", "caption.txt")
+            train_img_dir = os.path.join(self.data_root, "train", "image") # Điều chỉnh nếu cấu trúc khác
+            val_caption_path = os.path.join(self.data_root, "val", "caption.txt") # Giả sử có tập val
+            val_img_dir = os.path.join(self.data_root, "val", "image") # Giả sử có tập val
+
+            if not os.path.exists(train_caption_path):
+                 raise FileNotFoundError(f"Training caption file not found: {train_caption_path}")
+            if not os.path.exists(val_caption_path):
+                 print(f"Warning: Validation caption file not found: {val_caption_path}. Validation set will be empty.")
+                 # Có thể tạo dataset rỗng hoặc sử dụng một phần train set làm val
+                 self.val_dataset = None # Hoặc một dataset rỗng
+            else:
+                 self.val_dataset = CustomDataset(
+                    caption_file=val_caption_path,
+                    img_dir=val_img_dir,
+                    transform=self.val_transform,
+                    max_height=self.max_image_size[0],
+                    max_width=self.max_image_size[1],
+                 )
+                 print(f"Validation dataset size: {len(self.val_dataset)}")
+
+
+            self.train_dataset = CustomDataset(
+                caption_file=train_caption_path,
+                img_dir=train_img_dir,
+                transform=self.train_transform,
+                max_height=self.max_image_size[0],
+                max_width=self.max_image_size[1],
+            )
+            print(f"Training dataset size: {len(self.train_dataset)}")
+
+
+        # Test setup
+        if stage == "test" or stage is None:
+            test_caption_path = os.path.join(self.data_root, "test", "caption.txt")
+            test_img_dir = os.path.join(self.data_root, "test", "images") # Điều chỉnh nếu cấu trúc khác
+
+            if not os.path.exists(test_caption_path):
+                 raise FileNotFoundError(f"Test caption file not found: {test_caption_path}")
+
+            self.test_dataset = CustomDataset(
+                caption_file=test_caption_path,
+                img_dir=test_img_dir,
+                transform=self.test_transform,
+                max_height=self.max_image_size[0],
+                max_width=self.max_image_size[1],
+            )
+            print(f"Test dataset size: {len(self.test_dataset)}")
+
+    def train_dataloader(self):
+        if not hasattr(self, 'train_dataset') or self.train_dataset is None:
+             raise RuntimeError("Train dataset not initialized. Call setup('fit') first.")
         return DataLoader(
             self.train_dataset,
-            batch_size=self.train_batch_size,
+            batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            collate_fn=collate_fn,
+            pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn, # Sử dụng collate_fn tùy chỉnh hoặc mặc định
         )
 
-    def val_dataloader(self) -> DataLoader:
+    def val_dataloader(self):
+        if not hasattr(self, 'val_dataset') or self.val_dataset is None:
+             print("Warning: Validation dataset not available or initialized.")
+             # Trả về một DataLoader rỗng hoặc raise lỗi tùy theo logic mong muốn
+             return DataLoader([], batch_size=self.batch_size) # DataLoader rỗng
+             # raise RuntimeError("Validation dataset not initialized. Call setup('fit') first.")
+
         return DataLoader(
             self.val_dataset,
-            batch_size=self.eval_batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_fn,
+            pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn, # Sử dụng collate_fn tùy chỉnh hoặc mặc định
         )
 
-    def test_dataloader(self) -> DataLoader:
+    def test_dataloader(self):
+        if not hasattr(self, 'test_dataset') or self.test_dataset is None:
+             raise RuntimeError("Test dataset not initialized. Call setup('test') first.")
         return DataLoader(
             self.test_dataset,
-            batch_size=self.eval_batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            collate_fn=collate_fn,
+            pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn, # Sử dụng collate_fn tùy chỉnh hoặc mặc định
         )
+
+    def default_collate_fn(self, batch: List[Tuple[Any, str]]):
+        """
+        Collate function mặc định để xử lý batch.
+        Tokenize các công thức và pad chúng.
+        """
+        # Tách ảnh và công thức
+        batch_imgs, batch_formulas_str = zip(*batch)
+
+        # Xử lý ảnh (thường là xếp chồng nếu chúng có cùng kích thước)
+        # Lưu ý: Nếu ảnh có kích thước khác nhau sau transform, cần padding ở đây.
+        # ScaleToLimitRange đảm bảo chúng có cùng kích thước tối đa, nhưng có thể cần padding
+        # đến kích thước đó nếu ảnh gốc nhỏ hơn. Tensor collation sẽ tự động tạo batch.
+        batch_imgs_padded = torch.stack(batch_imgs, 0) # Giả sử ToTensor đã được áp dụng
+
+        # Tokenize và pad công thức
+        batch_formulas_tokenized = self.vocab(batch_formulas_str) # Sử dụng vocab đã lưu
+        # Pad sequences to the max length in this batch
+        max_len = max(len(f) for f in batch_formulas_tokenized)
+        batch_formulas_padded = []
+        for formula in batch_formulas_tokenized:
+            padded_formula = formula + [self.vocab.PAD_IDX] * (max_len - len(formula))
+            batch_formulas_padded.append(torch.tensor(padded_formula, dtype=torch.long))
+
+        batch_formulas_padded = torch.stack(batch_formulas_padded, 0)
+
+        return batch_imgs_padded, batch_formulas_padded
+
+

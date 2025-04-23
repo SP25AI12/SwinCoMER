@@ -47,5 +47,5 @@ data:
   data_root: "customdataset"
   train_batch_size: 4
   eval_batch_size: 2
-  num_workers: 5
+  num_workers: 1
   scale_aug: true
