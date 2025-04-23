@@ -23,7 +23,7 @@ def extract_data_dir(data_dir: str) -> Data:
     Returns list of (base, PIL.Image in grayscale, tokens list).
     """
     caption_path = os.path.join(data_dir, 'caption.txt')
-    image_dir = os.path.join(data_dir, 'images')
+    image_dir = os.path.join(data_dir, 'image')
 
     data: Data = []
     with open(caption_path, 'r', encoding='utf-8') as f:
